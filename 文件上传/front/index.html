@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document</title>
+</head>
+
+<body>
+    <input class="ipt" type="file" />
+</body>
+<script src="https://cdn.bootcdn.net/ajax/libs/spark-md5/3.0.2/spark-md5.min.js"></script>
+<script>
+    const ipt = document.querySelector('.ipt');
+    // 切片的大小
+    const chunkSize = 1 * 1024 * 1024;
+    let hashName = '';
+    // 切片
+    const cut = async (file) => new Promise(res => {
+        if (!file) return;
+        const chunks = [];
+        let currentSize = 0;
+        while (currentSize < file.size) {
+            const blob = file.slice(currentSize, currentSize + chunkSize, file.type);
+            // console.log('blob', blob);
+            chunks.push(blob);
+            currentSize += chunkSize;
+        }
+        res(chunks);
+    });
+    // 为文件生成哈希值 确保文件的唯一性吗 为后端合并文件做准备
+    const hashChunk = (chunks) => new Promise(res => {
+        // 存储需要计算哈希的chunk
+        const targets = [];
+        console.log('chunks', chunks);
+        //使用 spark-md5 生成哈希值
+        const spark = new SparkMD5.ArrayBuffer();
+        const fileReader = new FileReader();
+        chunks.forEach((chunk, index) => {
+            // 第一个和最后一个切片全部参与计算哈希值
+            if (index === 0 || index === chunks.length - 1) {
+                targets.push(chunk);
+            } else {
+                // 中间切片只计算前面两个字节
+                targets.push(chunk.slice(0, 2));
+                // 中间两个字节
+                targets.push(chunk.slice(chunk.size / 2, chunk.size / 2 + 2));
+                // 最后两个字节
+                targets.push(chunk.slice(chunk.size - 2, chunk.size));
+                // 目的是避免文件太大哈希生成太久，这样既快速又能保证哈希唯一
+            }
+        });
+        // 读取 chunk
+        fileReader.readAsArrayBuffer(new Blob(targets));
+        // 读取完成 
+        fileReader.onload = (e) => {
+
+            spark.append(e.target.result);
+            const hash = spark.end();
+            res(hash);
+        };
+    });
+
+    // 上传前的文件校验
+    const verity = (fileInfo) => {
+        return new Promise((resolve) => fetch("http://47.100.1.135:3000/verity", {
+            method: 'POST',
+            body: JSON.stringify(fileInfo),
+            headers: {
+                "Content-Type": "application/json"
+            }
+        }).then(res => res.json()).then(data => {
+            resolve(data);
+        })
+        );
+    };
+    // 上传完成后发送合并文件请求
+    const merge = (fileInfo) => {
+        fetch('http://47.100.1.135:3000/merge', {
+            headers: {
+                "Content-Type": "application/json"
+            },
+            method: 'POST',
+            body: JSON.stringify(fileInfo),
+            mode: "cors"
+        }).then(response => response.json()).then(data => {
+            console.log('合并文件状态', data);
+        }).catch(error => {
+            console.log('err', error);
+        });
+    };
+    // 上传文件
+    const upload = async (chunks, file) => {
+
+        const info = await verity({
+            fileHash: hashName,
+            filename: file.name,
+            chunkSize
+        });
+        console.log('数据验证', info);
+        if (!info.upload && !info.uploadedChunks) {
+            console.log("文件上传成功");
+            return { msg: '文件上传成功过' };
+        };
+        // 切片数据
+        const data = chunks.map((chunk, index) => ({
+            // 切割的文件
+            chunk: chunk,
+            // 判断是不是同一个文件
+            fileHash: hashName,
+            // 判断 chunk 的顺序
+            chunkHash: `${hashName} - ${index}`,
+        }));
+
+        // 创建 formData
+        let formData = data.map(item => {
+            const formData = new FormData();
+            formData.append('fileHash', item.fileHash);
+            formData.append('chunkHash', item.chunkHash);
+            formData.append('chunk', item.chunk);
+            return formData;
+        });
+        if (info.uploadedChunks) {
+            // 断点续传：过滤已经上传的切片
+            formData = formData.filter(item => {
+                const chunkHash = item.get('chunkHash');
+                return info.uploadedChunks.findIndex(item => item == chunkHash) == -1;
+            });
+            console.log('过滤后的切片', formData);
+        }
+        // 限制每次发送请求数，避免卡死
+        // 最大请求书
+        const max = 4;
+        // 请求任务
+        const task = [];
+        // 请求次数
+        let index = 0; 2;
+        let percent = 0;
+
+        // 循环上传formData
+        while (index < formData.length) {
+            // 请求
+            const fehch = fetch('http://47.100.1.135:3000/upload', {
+                method: 'POST',
+                body: formData[index],
+                mode: "cors"
+            });
+            // 异步任务最后执行
+            fehch.then((response) => {
+                // 将自己从任务中删除
+                task.splice(task.findIndex(item => item === fehch));
+            });
+            // 添加请求
+            task.push(fehch);
+            // 当请求队列中的请求数达到最大请求并行数的时候，等待之前的请求完成再循环下一个
+            if (task.length === max) {
+                await Promise.race(task);
+            }
+            index++;
+            percent = ((index / formData.length) * 100).toFixed(0);
+            console.log('完成：', percent);
+        }
+        // 确保所有请求完成
+        await Promise.all(task);
+    };
+
+    ipt.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        console.log(file);
+        console.log('开始切片上传');
+        const chunks = await cut(file);
+        hashName = await hashChunk(chunks);
+        await upload(chunks, file);
+        merge({
+            filename: file.name,
+            chunkSize: chunkSize,
+            fileHash: hashName
+        });
+    })
+</script>
+
+</html>

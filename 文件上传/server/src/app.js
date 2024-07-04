@@ -1,7 +1,7 @@
 const express = require("express");
 const app = express();
 const router = require("./routes/routes");
-const cors = require("cors");
+require("dotenv").config();
 // 跨域处理
 app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", req.headers.origin);
